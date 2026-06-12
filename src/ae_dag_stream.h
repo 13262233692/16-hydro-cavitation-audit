@@ -27,119 +27,302 @@ struct AERawHeader {
     uint32_t channels;
     uint64_t start_epoch_ns;
     uint32_t frame_size;
-    uint32_t reserved[5];
+    uint32_t header_crc32;
+    uint32_t reserved[4];
 };
+#pragma pack(pop)
+
+static_assert(sizeof(AERawHeader) == 48, "AERawHeader must be exactly 48 bytes");
 
 struct AEFrame {
     uint64_t hw_timestamp_ns;
     int16_t  amplitude_mv;
 };
-#pragma pack(pop)
 
 struct AEReference {
     const AEFrame* ptr;
     size_t         count;
 };
 
+inline uint32_t crc32_table[256];
+inline bool crc32_table_init = false;
+
+inline void ensure_crc32_table() {
+    if (crc32_table_init) return;
+    for (uint32_t i = 0; i < 256; ++i) {
+        uint32_t c = i;
+        for (int j = 0; j < 8; ++j) {
+            if (c & 1) c = 0xEDB88320u ^ (c >> 1);
+            else       c >>= 1;
+        }
+        crc32_table[i] = c;
+    }
+    crc32_table_init = true;
+}
+
+inline uint32_t compute_crc32(const void* data, size_t len) {
+    ensure_crc32_table();
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc = crc32_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
+    }
+    return crc ^ 0xFFFFFFFFu;
+}
+
+#ifdef _WIN32
+
+struct WinHandleDeleter {
+    void operator()(void* h) const {
+        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(static_cast<HANDLE>(h));
+    }
+};
+
+struct WinMappingDeleter {
+    size_t file_size;
+    void operator()(const void* base) const {
+        if (base) UnmapViewOfFile(base);
+    }
+};
+
+struct WinFileMappingDeleter {
+    void operator()(void* m) const {
+        if (m) CloseHandle(static_cast<HANDLE>(m));
+    }
+};
+
+using WinHandleUniquePtr = std::unique_ptr<void, WinHandleDeleter>;
+using WinMappingUniquePtr = std::unique_ptr<const void, WinMappingDeleter>;
+using WinFileMappingUniquePtr = std::unique_ptr<void, WinFileMappingDeleter>;
+
+#else
+
+struct PosixFdDeleter {
+    void operator()(int* fd) const {
+        if (fd && *fd >= 0) { ::close(*fd); delete fd; }
+    }
+};
+
+struct PosixMmapDeleter {
+    size_t file_size;
+    void operator()(void* base) const {
+        if (base && base != MAP_FAILED) munmap(base, file_size);
+    }
+};
+
+using PosixFdUniquePtr = std::unique_ptr<int, PosixFdDeleter>;
+using PosixMmapUniquePtr = std::unique_ptr<void, PosixMmapDeleter>;
+
+#endif
+
 class MappedFile {
 public:
     MappedFile() = default;
-    ~MappedFile() { unmap(); }
+    ~MappedFile() = default;
     MappedFile(const MappedFile&) = delete;
     MappedFile& operator=(const MappedFile&) = delete;
 
-    bool open(const std::string& path) {
+    MappedFile(MappedFile&& other) noexcept
+        : base_(other.base_), file_size_(other.file_size_)
 #ifdef _WIN32
-        handle_ = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (handle_ == INVALID_HANDLE_VALUE) return false;
+        , handle_(std::move(other.handle_))
+        , file_mapping_(std::move(other.file_mapping_))
+        , view_mapping_(std::move(other.view_mapping_))
+#else
+        , fd_owner_(std::move(other.fd_owner_))
+        , mmap_owner_(std::move(other.mmap_owner_))
+#endif
+    {
+        other.base_ = nullptr;
+        other.file_size_ = 0;
+    }
+
+    MappedFile& operator=(MappedFile&& other) noexcept {
+        if (this != &other) {
+            close();
+            base_ = other.base_;
+            file_size_ = other.file_size_;
+#ifdef _WIN32
+            handle_ = std::move(other.handle_);
+            file_mapping_ = std::move(other.file_mapping_);
+            view_mapping_ = std::move(other.view_mapping_);
+#else
+            fd_owner_ = std::move(other.fd_owner_);
+            mmap_owner_ = std::move(other.mmap_owner_);
+#endif
+            other.base_ = nullptr;
+            other.file_size_ = 0;
+        }
+        return *this;
+    }
+
+    bool open(const std::string& path) {
+        close();
+
+#ifdef _WIN32
+        HANDLE hFile = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                   nullptr, OPEN_EXISTING,
+                                   FILE_ATTRIBUTE_READONLY | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return false;
+        handle_.reset(hFile);
 
         LARGE_INTEGER li;
-        if (!GetFileSizeEx(handle_, &li)) { CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE; return false; }
+        if (!GetFileSizeEx(hFile, &li)) { handle_.reset(); return false; }
         file_size_ = static_cast<size_t>(li.QuadPart);
 
-        mapping_ = CreateFileMappingA(handle_, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!mapping_) { CloseHandle(handle_); handle_ = INVALID_HANDLE_VALUE; return false; }
+        HANDLE hMap = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hMap) { handle_.reset(); return false; }
+        file_mapping_.reset(hMap);
 
-        base_ = static_cast<const uint8_t*>(MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0));
-        if (!base_) { CloseHandle(mapping_); CloseHandle(handle_); mapping_ = nullptr; handle_ = INVALID_HANDLE_VALUE; return false; }
+        const void* pView = MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, 0);
+        if (!pView) { file_mapping_.reset(); handle_.reset(); return false; }
+        view_mapping_ = WinMappingUniquePtr(pView, WinMappingDeleter{file_size_});
+        base_ = static_cast<const uint8_t*>(pView);
 #else
-        fd_ = ::open(path.c_str(), O_RDONLY);
-        if (fd_ < 0) return false;
+        int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+        fd_owner_ = PosixFdUniquePtr(new int(fd));
 
         struct stat st;
-        if (fstat(fd_, &st) < 0) { ::close(fd_); fd_ = -1; return false; }
+        if (fstat(fd, &st) < 0) { fd_owner_.reset(); return false; }
         file_size_ = static_cast<size_t>(st.st_size);
 
-        base_ = static_cast<const uint8_t*>(mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0));
-        if (base_ == MAP_FAILED) { base_ = nullptr; ::close(fd_); fd_ = -1; return false; }
+        void* pMap = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd, 0);
+        if (pMap == MAP_FAILED) { fd_owner_.reset(); return false; }
+        mmap_owner_ = PosixMmapUniquePtr(pMap, PosixMmapDeleter{file_size_});
+        base_ = static_cast<const uint8_t*>(pMap);
 #endif
         return true;
     }
 
-    void unmap() {
-        if (base_) {
+    void close() {
 #ifdef _WIN32
-            UnmapViewOfFile(base_);
-            CloseHandle(mapping_);
-            CloseHandle(handle_);
-            mapping_ = nullptr;
-            handle_ = INVALID_HANDLE_VALUE;
+        view_mapping_.reset();
+        file_mapping_.reset();
+        handle_.reset();
 #else
-            munmap(const_cast<uint8_t*>(base_), file_size_);
-            ::close(fd_);
-            fd_ = -1;
+        mmap_owner_.reset();
+        fd_owner_.reset();
 #endif
-            base_ = nullptr;
-            file_size_ = 0;
-        }
+        base_ = nullptr;
+        file_size_ = 0;
     }
 
     const uint8_t* data() const { return base_; }
     size_t         size() const { return file_size_; }
+    bool           is_open() const { return base_ != nullptr; }
 
 private:
     const uint8_t* base_ = nullptr;
     size_t         file_size_ = 0;
 
 #ifdef _WIN32
-    HANDLE handle_  = INVALID_HANDLE_VALUE;
-    HANDLE mapping_ = nullptr;
+    WinHandleUniquePtr       handle_{nullptr, WinHandleDeleter{}};
+    WinFileMappingUniquePtr  file_mapping_{nullptr, WinFileMappingDeleter{}};
+    WinMappingUniquePtr      view_mapping_{nullptr, WinMappingDeleter{0}};
 #else
-    int fd_ = -1;
+    PosixFdUniquePtr    fd_owner_{nullptr, PosixFdDeleter{}};
+    PosixMmapUniquePtr  mmap_owner_{nullptr, PosixMmapDeleter{0}};
 #endif
+};
+
+enum class AELoadError {
+    None,
+    FileOpenFailed,
+    FileTooSmall,
+    MagicMismatch,
+    VersionUnsupported,
+    ChecksumError,
+    FrameSizeMismatch,
+    ZeroFrames,
 };
 
 class AEDAGStream {
 public:
     AEDAGStream() = default;
 
-    bool load(const std::string& path) {
-        if (!mmap_.open(path)) return false;
+    AELoadError load(const std::string& path) {
+        mmap_.close();
+        header_ = AERawHeader{};
+        frames_ = nullptr;
+        total_frames_ = 0;
+        last_error_ = AELoadError::None;
+        last_error_file_ = path;
+
+        if (!mmap_.open(path)) {
+            return fail(AELoadError::FileOpenFailed);
+        }
+
+        auto guard = make_guard();
 
         const uint8_t* base = mmap_.data();
         size_t sz = mmap_.size();
-        if (sz < sizeof(AERawHeader)) return false;
+        if (sz < sizeof(AERawHeader)) {
+            return fail(AELoadError::FileTooSmall);
+        }
 
         const AERawHeader* hdr = reinterpret_cast<const AERawHeader*>(base);
-        if (hdr->magic[0] != 'A' || hdr->magic[1] != 'E' ||
-            hdr->magic[2] != 'R' || hdr->magic[3] != 'W')
-            return false;
 
-        header_ = *hdr;
+        if (hdr->magic[0] != 'A' || hdr->magic[1] != 'E' ||
+            hdr->magic[2] != 'R' || hdr->magic[3] != 'W') {
+            return fail(AELoadError::MagicMismatch);
+        }
+
+        if (hdr->version != 1) {
+            return fail(AELoadError::VersionUnsupported);
+        }
+
+        size_t crc_len = offsetof(AERawHeader, header_crc32);
+        uint32_t computed = compute_crc32(base, crc_len);
+        if (computed != hdr->header_crc32 && hdr->header_crc32 != 0) {
+            return fail(AELoadError::ChecksumError);
+        }
+
+        size_t frame_sz = sizeof(AEFrame);
+        if (hdr->frame_size != frame_sz) {
+            return fail(AELoadError::FrameSizeMismatch);
+        }
 
         const uint8_t* payload = base + sizeof(AERawHeader);
         size_t payload_sz = sz - sizeof(AERawHeader);
-        size_t frame_sz = sizeof(AEFrame);
-        if (hdr->frame_size != frame_sz) return false;
+        size_t nframes = payload_sz / frame_sz;
+        if (nframes == 0) {
+            return fail(AELoadError::ZeroFrames);
+        }
 
-        total_frames_ = payload_sz / frame_sz;
+        header_ = *hdr;
         frames_ = reinterpret_cast<const AEFrame*>(payload);
-        return true;
+        total_frames_ = nframes;
+
+        guard.dismiss();
+        last_error_ = AELoadError::None;
+        return AELoadError::None;
+    }
+
+    void close() {
+        mmap_.close();
+        frames_ = nullptr;
+        total_frames_ = 0;
     }
 
     const AERawHeader& header() const { return header_; }
     size_t total_frames() const { return total_frames_; }
+    AELoadError last_error() const { return last_error_; }
+    const std::string& last_error_file() const { return last_error_file_; }
+
+    static const char* error_string(AELoadError e) {
+        switch (e) {
+            case AELoadError::None:              return "No error";
+            case AELoadError::FileOpenFailed:    return "Cannot open file (missing or locked)";
+            case AELoadError::FileTooSmall:      return "File too small for header";
+            case AELoadError::MagicMismatch:     return "Magic signature mismatch (not AERW)";
+            case AELoadError::VersionUnsupported:return "Unsupported header version";
+            case AELoadError::ChecksumError:     return "Header CRC32 checksum error (EMI corruption?)";
+            case AELoadError::FrameSizeMismatch: return "Frame size mismatch";
+            case AELoadError::ZeroFrames:        return "File contains zero frames";
+            default:                             return "Unknown error";
+        }
+    }
 
     AEReference reference(size_t offset, size_t count) const {
         if (offset + count > total_frames_) count = total_frames_ - offset;
@@ -172,10 +355,35 @@ public:
     }
 
 private:
+    struct ScopeGuard {
+        std::function<void()> fn;
+        bool active = true;
+        ~ScopeGuard() { if (active) fn(); }
+        void dismiss() { active = false; }
+    };
+
+    ScopeGuard make_guard() {
+        return ScopeGuard{[this]() {
+            this->mmap_.close();
+            this->frames_ = nullptr;
+            this->total_frames_ = 0;
+        }};
+    }
+
+    AELoadError fail(AELoadError e) {
+        mmap_.close();
+        frames_ = nullptr;
+        total_frames_ = 0;
+        last_error_ = e;
+        return e;
+    }
+
     MappedFile      mmap_;
     AERawHeader     header_{};
     const AEFrame*  frames_ = nullptr;
     size_t          total_frames_ = 0;
+    AELoadError     last_error_ = AELoadError::None;
+    std::string     last_error_file_;
 };
 
 }
