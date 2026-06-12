@@ -2,3 +2,5 @@ D:\SOLO-11\16-hydro-cavitation-audit\src\main.cpp;D:\SOLO-11\16-hydro-cavitation
 D:\SOLO-11\16-hydro-cavitation-audit\src\ae_dag_stream.cpp;D:\SOLO-11\16-hydro-cavitation-audit\build\cavitation_audit.dir\Release\ae_dag_stream.obj
 D:\SOLO-11\16-hydro-cavitation-audit\src\wpd_kernel.cpp;D:\SOLO-11\16-hydro-cavitation-audit\build\cavitation_audit.dir\Release\wpd_kernel.obj
 D:\SOLO-11\16-hydro-cavitation-audit\src\energy_matrix.cpp;D:\SOLO-11\16-hydro-cavitation-audit\build\cavitation_audit.dir\Release\energy_matrix.obj
+D:\SOLO-11\16-hydro-cavitation-audit\src\palmgren_miner.cpp;D:\SOLO-11\16-hydro-cavitation-audit\build\cavitation_audit.dir\Release\palmgren_miner.obj
+D:\SOLO-11\16-hydro-cavitation-audit\src\life_prediction_report.cpp;D:\SOLO-11\16-hydro-cavitation-audit\build\cavitation_audit.dir\Release\life_prediction_report.obj

@@ -164,12 +164,21 @@ public:
         return ratios;
     }
 
+    static size_t gray_code(size_t n) {
+        return n ^ (n >> 1);
+    }
+
+    static size_t natural_to_freq_order(size_t band_idx) {
+        return gray_code(band_idx);
+    }
+
     static void compute_band_freq_range(uint32_t sample_rate, size_t band_idx,
                                         double& f_low, double& f_high) {
         double nyquist = sample_rate / 2.0;
         double band_width = nyquist / NUM_BANDS;
-        f_low  = band_idx * band_width;
-        f_high = (band_idx + 1) * band_width;
+        size_t freq_slot = natural_to_freq_order(band_idx);
+        f_low  = freq_slot * band_width;
+        f_high = (freq_slot + 1) * band_width;
     }
 };
 

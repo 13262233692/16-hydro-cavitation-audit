@@ -10,24 +10,27 @@
 #include "ae_dag_stream.h"
 #include "wpd_kernel.h"
 #include "energy_matrix.h"
+#include "palmgren_miner.h"
+#include "life_prediction_report.h"
 
 namespace fs = std::filesystem;
 
 static void print_usage(const char* prog) {
     std::fprintf(stderr,
-        "Hydro Cavitation Audit Tool v1.1.0\n"
+        "Hydro Cavitation Audit Tool v1.2.0\n"
         "Usage:\n"
         "  %s <input.dat> [options]            Single file analysis\n"
         "  %s --batch <dir_or_glob> [options]   Batch scan directory\n"
         "\n"
         "Options:\n"
         "  -c, --chunk <N>        Frames per WPD chunk (default: 8192)\n"
+        "  --daily-hours <H>      Daily operation hours for life prediction (default: 24)\n"
         "  --generate-test <path> Generate synthetic test .dat file\n"
         "  --generate-corrupt <N> Generate N corrupted files for leak testing\n"
         "  -h, --help             Show this help\n"
         "\n"
         "AE binary format (.dat):\n"
-        "  Header: 64 bytes (magic 'AERW', version, sample_rate, channels, epoch_ns, crc32, ...)\n"
+        "  Header: 48 bytes (magic 'AERW', version, sample_rate, channels, epoch_ns, crc32, ...)\n"
         "  Frames: 10 bytes each (uint64 hw_timestamp_ns + int16 amplitude_mv)\n",
         prog, prog);
 }
@@ -58,8 +61,10 @@ static void generate_test_dat(const std::string& path, uint32_t sample_rate, siz
 
     double f1 = 35000.0;
     double f2 = 80000.0;
-    double f3 = 120000.0;
+    double f3 = 145000.0;
     double f4 = 5000.0;
+    double f5 = 160000.0;
+    double f6 = 170000.0;
 
     for (size_t i = 0; i < num_frames; ++i) {
         cavitation::AEFrame frame{};
@@ -67,17 +72,19 @@ static void generate_test_dat(const std::string& path, uint32_t sample_rate, siz
 
         double t = static_cast<double>(i) / sample_rate;
 
-        double sig = 0.3 * std::sin(2.0 * 3.14159265358979323846 * f1 * t)
-                   + 0.5 * std::sin(2.0 * 3.14159265358979323846 * f2 * t)
-                   + 0.15 * std::sin(2.0 * 3.14159265358979323846 * f3 * t)
-                   + 0.4 * std::sin(2.0 * 3.14159265358979323846 * f4 * t);
+        double sig = 0.05 * std::sin(2.0 * 3.14159265358979323846 * f1 * t)
+                   + 0.08 * std::sin(2.0 * 3.14159265358979323846 * f2 * t)
+                   + 2.5 * std::sin(2.0 * 3.14159265358979323846 * f3 * t)
+                   + 2.0 * std::sin(2.0 * 3.14159265358979323846 * f5 * t)
+                   + 1.8 * std::sin(2.0 * 3.14159265358979323846 * f6 * t)
+                   + 0.05 * std::sin(2.0 * 3.14159265358979323846 * f4 * t);
 
         double burst = 0.0;
-        size_t period = 8192;
+        size_t period = 4096;
         size_t pos = i % period;
-        if (pos > period - 64) {
-            burst = 2.0 * std::sin(2.0 * 3.14159265358979323846 * 90000.0 * t)
-                  * std::exp(-static_cast<double>(pos - (period - 64)) / 15.0);
+        if (pos > period - 256) {
+            burst = 8.0 * std::sin(2.0 * 3.14159265358979323846 * 150000.0 * t)
+                  * std::exp(-static_cast<double>(pos - (period - 256)) / 40.0);
         }
 
         double noise = 0.02 * ((std::rand() % 2000 - 1000) / 1000.0);
@@ -145,6 +152,8 @@ struct BatchStats {
 
 static bool process_single_file(const std::string& path, size_t chunk_frames,
                                 cavitation::EnergyMatrix& matrix,
+                                cavitation::PalmgrenMinerAccumulator& miner,
+                                uint32_t& out_sample_rate,
                                 size_t& frame_count, double& decomp_ms) {
     cavitation::AEDAGStream stream;
     auto err = stream.load(path);
@@ -158,6 +167,7 @@ static bool process_single_file(const std::string& path, size_t chunk_frames,
     const auto& hdr = stream.header();
     size_t total = stream.total_frames();
     frame_count = total;
+    out_sample_rate = hdr.sample_rate_hz;
 
     std::fprintf(stderr, "  [OK]   %s — %u Hz, %zu frames (%.3fs)\n",
                  path.c_str(), hdr.sample_rate_hz, total,
@@ -183,6 +193,10 @@ static bool process_single_file(const std::string& path, size_t chunk_frames,
             row.energies[b] = bands[b].energy;
         }
         matrix.add_row(std::move(row));
+
+        std::array<double, 8> band_energies_arr;
+        for (size_t b = 0; b < 8; ++b) band_energies_arr[b] = bands[b].energy;
+        miner.process_chunk(hdr.sample_rate_hz, ref.count, band_energies_arr, ratios);
     });
 
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -192,7 +206,7 @@ static bool process_single_file(const std::string& path, size_t chunk_frames,
     return true;
 }
 
-static int run_batch(const std::string& dir_path, size_t chunk_frames) {
+static int run_batch(const std::string& dir_path, size_t chunk_frames, double daily_hours) {
     BatchStats stats;
     auto wall_start = std::chrono::high_resolution_clock::now();
 
@@ -217,6 +231,8 @@ static int run_batch(const std::string& dir_path, size_t chunk_frames) {
     std::fprintf(stderr, "Found %zu .dat files\n\n", stats.total_files);
 
     cavitation::EnergyMatrix matrix;
+    cavitation::PalmgrenMinerAccumulator miner;
+    uint32_t sample_rate = 500000;
 
     for (size_t fi = 0; fi < dat_files.size(); ++fi) {
         const std::string path = dat_files[fi].string();
@@ -224,12 +240,14 @@ static int run_batch(const std::string& dir_path, size_t chunk_frames) {
 
         size_t fcount = 0;
         double dms = 0.0;
-        bool ok = process_single_file(path, chunk_frames, matrix, fcount, dms);
+        uint32_t sr = 500000;
+        bool ok = process_single_file(path, chunk_frames, matrix, miner, sr, fcount, dms);
 
         if (ok) {
             stats.ok_files++;
             stats.total_frames += fcount;
             stats.total_decomp_ms += dms;
+            sample_rate = sr;
         } else {
             stats.failed_files++;
             stats.errors.emplace_back(path, cavitation::AELoadError::FileOpenFailed);
@@ -247,25 +265,25 @@ static int run_batch(const std::string& dir_path, size_t chunk_frames) {
     std::fprintf(stderr, "     Decomp time : %.2f ms\n", stats.total_decomp_ms);
 
     if (stats.total_frames > 0) {
-        uint32_t sample_rate = 500000;
         matrix.print_summary(sample_rate);
+        print_residual_life_report(miner, sample_rate, daily_hours);
     }
 
     if (!stats.errors.empty()) {
         std::fprintf(stderr, "  Failed files:\n");
         for (auto& [p, e] : stats.errors) {
-            std::fprintf(stderr, "    ✗ %s\n", p.c_str());
+            std::fprintf(stderr, "    x %s\n", p.c_str());
         }
     }
 
     auto wall_end = std::chrono::high_resolution_clock::now();
     double wall_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
-    std::fprintf(stderr, "[✓] Batch wall time: %.2f ms\n", wall_ms);
+    std::fprintf(stderr, "[ok] Batch wall time: %.2f ms\n", wall_ms);
 
     return stats.failed_files > 0 ? 2 : 0;
 }
 
-static int run_single(const std::string& input_path, size_t chunk_frames) {
+static int run_single(const std::string& input_path, size_t chunk_frames, double daily_hours) {
     auto wall_start = std::chrono::high_resolution_clock::now();
 
     std::fprintf(stderr, "[*] Loading AE binary log: %s\n", input_path.c_str());
@@ -282,7 +300,7 @@ static int run_single(const std::string& input_path, size_t chunk_frames) {
     const auto& hdr = stream.header();
     size_t total = stream.total_frames();
 
-    std::fprintf(stderr, "[✓] File mapped successfully (zero-copy DAG, RAII-guarded)\n");
+    std::fprintf(stderr, "[ok] File mapped successfully (zero-copy DAG, RAII-guarded)\n");
     std::fprintf(stderr, "    Sample rate : %u Hz\n", hdr.sample_rate_hz);
     std::fprintf(stderr, "    Channels    : %u\n", hdr.channels);
     std::fprintf(stderr, "    Start epoch : %llu ns\n", (unsigned long long)hdr.start_epoch_ns);
@@ -294,6 +312,7 @@ static int run_single(const std::string& input_path, size_t chunk_frames) {
                  static_cast<double>(chunk_frames) / hdr.sample_rate_hz * 1000.0);
 
     cavitation::EnergyMatrix matrix;
+    cavitation::PalmgrenMinerAccumulator miner;
 
     std::vector<double> signal_buf(chunk_frames);
 
@@ -318,6 +337,10 @@ static int run_single(const std::string& input_path, size_t chunk_frames) {
         }
         matrix.add_row(std::move(row));
 
+        std::array<double, 8> band_energies_arr;
+        for (size_t b = 0; b < 8; ++b) band_energies_arr[b] = bands[b].energy;
+        miner.process_chunk(hdr.sample_rate_hz, ref.count, band_energies_arr, ratios);
+
         if (chunk_idx % 50 == 0) {
             std::fprintf(stderr, "    Processed chunk %zu / ~%zu\r",
                          chunk_idx, total / chunk_frames);
@@ -327,19 +350,20 @@ static int run_single(const std::string& input_path, size_t chunk_frames) {
     auto decomp_end = std::chrono::high_resolution_clock::now();
     double decomp_ms = std::chrono::duration<double, std::milli>(decomp_end - decomp_start).count();
 
-    std::fprintf(stderr, "\n[✓] WPD decomposition complete\n");
+    std::fprintf(stderr, "\n[ok] WPD decomposition complete\n");
     std::fprintf(stderr, "    Chunks processed: %zu\n", matrix.row_count());
     std::fprintf(stderr, "    Decomposition time: %.2f ms\n", decomp_ms);
     std::fprintf(stderr, "    Throughput: %.1f kFrames/s\n",
                  static_cast<double>(total) / decomp_ms);
 
     matrix.print_summary(hdr.sample_rate_hz);
+    print_residual_life_report(miner, hdr.sample_rate_hz, daily_hours);
 
     stream.close();
 
     auto wall_end = std::chrono::high_resolution_clock::now();
     double wall_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
-    std::fprintf(stderr, "[✓] Total wall time: %.2f ms\n", wall_ms);
+    std::fprintf(stderr, "[ok] Total wall time: %.2f ms\n", wall_ms);
 
     return 0;
 }
@@ -355,6 +379,7 @@ int main(int argc, char* argv[]) {
     size_t chunk_frames = 8192;
     bool generate_test = false;
     int generate_corrupt = 0;
+    double daily_hours = 24.0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
@@ -365,6 +390,12 @@ int main(int argc, char* argv[]) {
             if (i + 1 < argc) {
                 chunk_frames = std::atoll(argv[++i]);
                 if (chunk_frames < 64) chunk_frames = 64;
+            }
+        } else if (arg == "--daily-hours") {
+            if (i + 1 < argc) {
+                daily_hours = std::atof(argv[++i]);
+                if (daily_hours < 1.0) daily_hours = 1.0;
+                if (daily_hours > 24.0) daily_hours = 24.0;
             }
         } else if (arg == "--generate-test") {
             generate_test = true;
@@ -391,7 +422,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!batch_dir.empty()) {
-        return run_batch(batch_dir, chunk_frames);
+        return run_batch(batch_dir, chunk_frames, daily_hours);
     }
 
     if (input_path.empty()) {
@@ -400,5 +431,5 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    return run_single(input_path, chunk_frames);
+    return run_single(input_path, chunk_frames, daily_hours);
 }

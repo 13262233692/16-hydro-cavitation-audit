@@ -72,10 +72,10 @@ public:
         }
 
         for (size_t b = 0; b < WPDKernel::NUM_BANDS; ++b) {
-            double f_lo = b * bw / 1000.0;
-            double f_hi = (b + 1) * bw / 1000.0;
+            double f_lo, f_hi;
+            WPDKernel::compute_band_freq_range(sample_rate, b, f_lo, f_hi);
             std::printf("║  S[%zu]  │ %7.1f — %-7.1f  │    %8.4f %%     │  %20.6e  ║\n",
-                         b, f_lo, f_hi, g_ratios[b] * 100.0, total_e[b]);
+                         b, f_lo / 1000.0, f_hi / 1000.0, g_ratios[b] * 100.0, total_e[b]);
         }
 
         std::printf("╠══════════════════════════════════════════════════════════════════════════════╣\n");
@@ -124,15 +124,19 @@ public:
         }
 
         std::printf("\n");
+        double dom_f_lo, dom_f_hi;
+        WPDKernel::compute_band_freq_range(sample_rate, max_band, dom_f_lo, dom_f_hi);
         std::printf("  ► Dominant sub-band : S[%zu] (%.1f — %.1f kHz, %.4f%% energy)\n",
-                     max_band, max_band * bw / 1000.0, (max_band + 1) * bw / 1000.0,
+                     max_band, dom_f_lo / 1000.0, dom_f_hi / 1000.0,
                      max_ratio * 100.0);
 
         double cav_band_energy = 0.0;
         double total_energy = 0.0;
         for (size_t b = 0; b < WPDKernel::NUM_BANDS; ++b) {
             total_energy += total_e[b];
-            double f_center = (b + 0.5) * bw;
+            double f_lo, f_hi;
+            WPDKernel::compute_band_freq_range(sample_rate, b, f_lo, f_hi);
+            double f_center = (f_lo + f_hi) / 2.0;
             if (f_center >= 20000.0 && f_center <= 100000.0) {
                 cav_band_energy += total_e[b];
             }

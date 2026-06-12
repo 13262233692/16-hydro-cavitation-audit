@@ -13,6 +13,12 @@
     <ClCompile Include="D:\SOLO-11\16-hydro-cavitation-audit\src\energy_matrix.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="D:\SOLO-11\16-hydro-cavitation-audit\src\palmgren_miner.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="D:\SOLO-11\16-hydro-cavitation-audit\src\life_prediction_report.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <CustomBuild Include="D:\SOLO-11\16-hydro-cavitation-audit\CMakeLists.txt" />
