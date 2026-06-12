@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\SOLO-11\16-hydro-cavitation-audit\build\CMakeFiles\7fb90b4393d60913af8b6914766932f6\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{040F3C1E-68DC-3AD7-A85D-E98BBE504456}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
